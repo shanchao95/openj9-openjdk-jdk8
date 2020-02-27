@@ -1,6 +1,6 @@
 /*
  * ===========================================================================
- * (c) Copyright IBM Corp. 2018, 2019 All Rights Reserved
+ * (c) Copyright IBM Corp. 2018, 2020 All Rights Reserved
  * ===========================================================================
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -32,12 +32,15 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "jdk_crypto_jniprovider_NativeCrypto.h"
 #include "NativeCrypto_md.h"
 
 #define OPENSSL_VERSION_1_0 "OpenSSL 1.0."
 #define OPENSSL_VERSION_1_1 "OpenSSL 1.1."
+// needed for OpenSSL 1.0.2 Thread handling routines
+# define CRYPTO_LOCK             1
 
 //Header for RSA algorithm using 1.0.2 OpenSSL
 int OSSL102_RSA_set0_key(RSA *, BIGNUM *, BIGNUM *, BIGNUM *);
@@ -82,10 +85,29 @@ typedef BIGNUM* OSSL_BN_bin2bn_t (const unsigned char *, int, BIGNUM *);
 typedef void OSSL_BN_set_negative_t (BIGNUM *, int);
 typedef void OSSL_BN_free_t (BIGNUM *);
 
+typedef int OSSL_CRYPTO_num_locks_t();
+typedef void OSSL_CRYPTO_THREADID_set_numeric_t(CRYPTO_THREADID *id, unsigned long val);
+typedef void* OSSL_OPENSSL_malloc_t(size_t num);
+typedef void OSSL_OPENSSL_free_t(void *addr);
+typedef int OSSL_CRYPTO_THREADID_set_callback_t(void (*threadid_func)(CRYPTO_THREADID *));
+typedef void OSSL_CRYPTO_set_locking_callback_t(void (*func) (int mode, int type,const char *file, int line));
+
+int thread_setup();
+void thread_cleanup(void);
+void pthreads_thread_id(CRYPTO_THREADID *tid);
+void pthreads_locking_callback(int mode, int type, const char *file, int line);
+
 //Define pointers for OpenSSL functions to handle Errors.
 OSSL_error_string_t* OSSL_error_string;
 OSSL_error_string_n_t* OSSL_error_string_n;
 OSSL_get_error_t* OSSL_get_error;
+
+//Define pointers for OpenSSL 1.0.2 threading routines
+OSSL_CRYPTO_num_locks_t* OSSL_CRYPTO_num_locks;
+OSSL_CRYPTO_THREADID_set_numeric_t* OSSL_CRYPTO_THREADID_set_numeric;
+OSSL_OPENSSL_malloc_t* OSSL_OPENSSL_malloc;
+OSSL_CRYPTO_THREADID_set_callback_t* OSSL_CRYPTO_THREADID_set_callback;
+OSSL_CRYPTO_set_locking_callback_t* OSSL_CRYPTO_set_locking_callback;
 
 //Define pointers for OpenSSL functions to handle Message Digest algorithms.
 OSSL_sha_t* OSSL_sha1;
@@ -219,6 +241,15 @@ JNIEXPORT jint JNICALL Java_jdk_crypto_jniprovider_NativeCrypto_loadCrypto
     OSSL_error_string = (OSSL_error_string_t*)find_crypto_symbol(handle, "ERR_error_string");
     OSSL_get_error = (OSSL_get_error_t*)find_crypto_symbol(handle, "ERR_get_error");
 
+	// Load Threading routines for OpenSSL 1.0.2
+    if (0 == ossl_ver) {
+        OSSL_CRYPTO_num_locks = (OSSL_CRYPTO_num_locks_t*)find_crypto_symbol(handle, "CRYPTO_num_locks");
+        OSSL_CRYPTO_THREADID_set_numeric = (OSSL_CRYPTO_THREADID_set_numeric_t*)find_crypto_symbol(handle, "CRYPTO_THREADID_set_numeric");
+        OSSL_OPENSSL_malloc = (OSSL_OPENSSL_malloc_t*)find_crypto_symbol(handle, "CRYPTO_malloc");
+        OSSL_CRYPTO_THREADID_set_callback = (OSSL_CRYPTO_THREADID_set_callback_t*)find_crypto_symbol(handle, "CRYPTO_THREADID_set_callback");
+        OSSL_CRYPTO_set_locking_callback = (OSSL_CRYPTO_set_locking_callback_t*)find_crypto_symbol(handle, "CRYPTO_set_locking_callback");
+    }
+
     //Load the function symbols for OpenSSL Message Digest algorithms.
     OSSL_sha1 = (OSSL_sha_t*)find_crypto_symbol(handle, "EVP_sha1");
     OSSL_sha256 = (OSSL_sha_t*)find_crypto_symbol(handle, "EVP_sha256");
@@ -318,15 +349,56 @@ JNIEXPORT jint JNICALL Java_jdk_crypto_jniprovider_NativeCrypto_loadCrypto
         (NULL == OSSL_RSA_private_encrypt) ||
         (NULL == OSSL_BN_bin2bn) ||
         (NULL == OSSL_BN_set_negative) ||
-        (NULL == OSSL_BN_free)) {
-        //fprintf(stderr, "One or more of the required symbols are missing in the crypto library\n");
-        //fflush(stderr);
+        (NULL == OSSL_BN_free) ||
+        ((NULL == OSSL_CRYPTO_num_locks) && (0 == ossl_ver)) ||
+        ((NULL == OSSL_CRYPTO_THREADID_set_numeric) && (0 == ossl_ver)) ||
+        ((NULL == OSSL_OPENSSL_malloc) && (0 == ossl_ver)) ||
+        ((NULL == OSSL_CRYPTO_THREADID_set_callback) && (0 == ossl_ver)) ||
+        ((NULL == OSSL_CRYPTO_set_locking_callback) && (0 == ossl_ver))) {
+        // fprintf(stderr, "One or more of the required symbols are missing in the crypto library\n");
+        // fflush(stderr);
         unload_crypto_library(handle);
         return -1;
     } else {
+        if (0 == ossl_ver) {
+            if (0 != thread_setup()){
+                unload_crypto_library(handle);
+                return -1;
+            }
+        }
         return 0;
     }
  }
+
+static pthread_mutex_t *lock_cs;
+
+int thread_setup()
+{
+    int i;
+    lock_cs = (*OSSL_OPENSSL_malloc)((*OSSL_CRYPTO_num_locks)() * sizeof(pthread_mutex_t));
+    if (NULL == lock_cs) {
+        return -1;
+    }
+    for (i = 0; i < (*OSSL_CRYPTO_num_locks)(); i++) {
+        pthread_mutex_init(&(lock_cs[i]), NULL);
+    }
+    (*OSSL_CRYPTO_THREADID_set_callback)(pthreads_thread_id);
+    (*OSSL_CRYPTO_set_locking_callback)(pthreads_locking_callback);
+    return 0;
+}
+
+void pthreads_locking_callback(int mode, int type, const char *file, int line)
+{
+    if (0 != (mode & CRYPTO_LOCK)) {
+        pthread_mutex_lock(&(lock_cs[type]));
+    } else {
+        pthread_mutex_unlock(&(lock_cs[type]));
+    }
+}
+void pthreads_thread_id(CRYPTO_THREADID *tid)
+{
+    (*OSSL_CRYPTO_THREADID_set_numeric)(tid, (unsigned long)pthread_self());
+}
 
 /* Create Digest context
  *

@@ -32,7 +32,6 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 
 #include "jdk_crypto_jniprovider_NativeCrypto.h"
 #include "NativeCrypto_md.h"
@@ -41,6 +40,13 @@
 #define OPENSSL_VERSION_1_1 "OpenSSL 1.1."
 // needed for OpenSSL 1.0.2 Thread handling routines
 # define CRYPTO_LOCK             1
+
+#ifdef WINDOWS
+# include <windows.h>
+#else
+# include <pthread.h>
+#endif
+
 
 //Header for RSA algorithm using 1.0.2 OpenSSL
 int OSSL102_RSA_set0_key(RSA *, BIGNUM *, BIGNUM *, BIGNUM *);
@@ -93,9 +99,9 @@ typedef int OSSL_CRYPTO_THREADID_set_callback_t(void (*threadid_func)(CRYPTO_THR
 typedef void OSSL_CRYPTO_set_locking_callback_t(void (*func) (int mode, int type,const char *file, int line));
 
 int thread_setup();
-void thread_cleanup(void);
 void pthreads_thread_id(CRYPTO_THREADID *tid);
 void pthreads_locking_callback(int mode, int type, const char *file, int line);
+void win32_locking_callback(int mode, int type, const char *file, int line);
 
 //Define pointers for OpenSSL functions to handle Errors.
 OSSL_error_string_t* OSSL_error_string;
@@ -361,7 +367,7 @@ JNIEXPORT jint JNICALL Java_jdk_crypto_jniprovider_NativeCrypto_loadCrypto
         return -1;
     } else {
         if (0 == ossl_ver) {
-            if (0 != thread_setup()){
+            if (0 != thread_setup()) {
                 unload_crypto_library(handle);
                 return -1;
             }
@@ -370,6 +376,39 @@ JNIEXPORT jint JNICALL Java_jdk_crypto_jniprovider_NativeCrypto_loadCrypto
     }
  }
 
+#ifdef WINDOWS
+static HANDLE *lock_cs;
+
+int thread_setup()
+{
+    int i;
+    lock_cs = (*OSSL_OPENSSL_malloc)((*OSSL_CRYPTO_num_locks)() * sizeof(HANDLE));
+    if (NULL == lock_cs) {
+        return -1;
+    }
+    printf("!!!!!!!!!!!!!!! thread_setup 391!!!!!!!!!!!!!!!!!!!!\n");
+    for (i = 0; i < (*OSSL_CRYPTO_num_locks)(); i++) {
+        lock_cs[i] = CreateMutex(NULL, FALSE, NULL);
+    }
+    printf("!!!!!!!!!!!!!!! thread_setup 395!!!!!!!!!!!!!!!!!!!!\n");
+    (*OSSL_CRYPTO_set_locking_callback)((void (*)(int, int, char *, int))
+                                win32_locking_callback);
+    printf("!!!!!!!!!!!!!!! thread_setup done!!!!!!!!!!!!!!!!!!!!\n");
+    return 0;
+}
+
+void win32_locking_callback(int mode, int type, const char *file, int line)
+{
+    printf("!!!!!!!!!!!!!!! win32_locking_callback !!!!!!!!!!!!!!!!!!!!\n");
+    if (0 != (mode & CRYPTO_LOCK)) {
+        WaitForSingleObject(lock_cs[type], INFINITE);
+    } else {
+        ReleaseMutex(lock_cs[type]);
+    }
+    printf("!!!!!!!!!!!!!!! win32_locking_callback done !!!!!!!!!!!!!!!!!!!!\n");
+}
+
+#else
 static pthread_mutex_t *lock_cs;
 
 int thread_setup()
@@ -399,6 +438,7 @@ void pthreads_thread_id(CRYPTO_THREADID *tid)
 {
     (*OSSL_CRYPTO_THREADID_set_numeric)(tid, (unsigned long)pthread_self());
 }
+#endif
 
 /* Create Digest context
  *
